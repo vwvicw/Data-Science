@@ -1,0 +1,91 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, StratifiedKFold
+import lightgbm as lgb
+from sklearn.metrics import roc_auc_score, precision_score, recall_score
+from imblearn.over_sampling import SMOTE
+import shap
+import pickle
+
+# 1. Load data (placeholder for real dataset)
+df = pd.read_csv('transactions.csv')  # imbalanced data (~1:500)
+X = df.drop(['fraud'], axis=1)
+y = df['fraud']
+
+# 2. Train/test split
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, stratify=y, test_size=0.2, random_state=42
+)
+
+# 3. Address imbalance via SMOTE
+sm = SMOTE(random_state=42)
+X_sm, y_sm = sm.fit_resample(X_train, y_train)
+
+# 4. Hyperparameter tuning with stratified CV
+param_grid = {
+    'num_leaves': [31, 63],
+    'learning_rate': [0.05, 0.1],
+    'n_estimators': [100, 200],
+    'is_unbalanced': [True]
+}
+
+best_auc = 0
+best_model = None
+
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+for num_leaves in param_grid['num_leaves']:
+    for lr in param_grid['learning_rate']:
+        for ne in param_grid['n_estimators']:
+            model = lgb.LGBMClassifier(
+                num_leaves=num_leaves,
+                learning_rate=lr,
+                n_estimators=ne,
+                is_unbalanced=True
+            )
+            cv_aucs = []
+            for train_i, val_i in skf.split(X_sm, y_sm):
+                model.fit(X_sm.iloc[train_i], y_sm.iloc[train_i])
+                preds = model.predict_proba(X_sm.iloc[val_i])[:,1]
+                cv_aucs.append(roc_auc_score(y_sm.iloc[val_i], preds))
+            mean_auc = np.mean(cv_aucs)
+            if mean_auc > best_auc:
+                best_auc = mean_auc
+                best_model = model
+
+print(f"Best CV AUC: {best_auc:.4f}")
+
+# 5. Evaluate on holdout test set
+y_pred_proba = best_model.predict_proba(X_test)[:,1]
+auc = roc_auc_score(y_test, y_pred_proba)
+precision = precision_score(y_test, best_model.predict(X_test))
+recall = recall_score(y_test, best_model.predict(X_test))
+print(f"Test AUC: {auc:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}")
+
+# 6. Feature importance & explainability with SHAP
+explainer = shap.TreeExplainer(best_model)
+shap_values = explainer.shap_values(X_test)
+shap.summary_plot(shap_values, X_test, show=False)
+
+# 7. Save model for production use
+with open('lgb_fraud_model.pkl', 'wb') as f:
+    pickle.dump(best_model, f)
+
+# 8. Simple monitoring function (PSI example)
+def psi(expected, actual, buckets=10):
+    def scale_range(input, minval, maxval):
+        input += -(np.min(input))
+        input /= np.ptp(input)
+        input *= (maxval - minval)
+        input += minval
+        return input
+    breakpoints = np.linspace(0, 1, buckets + 1)
+    psi_value = 0
+    for i in range(buckets):
+        exp_pct = np.mean((expected >= breakpoints[i]) & (expected < breakpoints[i+1]))
+        act_pct = np.mean((actual >= breakpoints[i]) & (actual < breakpoints[i+1]))
+        psi_value += (exp_pct - act_pct) * np.log(exp_pct / act_pct + 1e-9)
+    return psi_value
+
+psi_val = psi(best_model.predict_proba(X_train)[:,1], y_pred_proba)
+print(f"PSI: {psi_val:.4f}")
+
