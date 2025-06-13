@@ -1,0 +1,135 @@
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import StratifiedKFold, RandomizedSearchCV, train_test_split
+from sklearn.metrics import roc_auc_score, recall_score, precision_recall_curve, roc_curve, confusion_matrix, make_scorer
+from sklearn.preprocessing import StandardScaler
+from imblearn.over_sampling import SMOTE
+import lightgbm as lgb
+from scipy.spatial.distance import cosine
+
+# 1. Feature Engineering Functions
+def sliding_window_features(df, time_col, target_col, window=3600):
+    df = df.sort_values(time_col)
+    freq = df[target_col].rolling(window=window, min_periods=1).count()
+    velocity = df[target_col].rolling(window=window, min_periods=1).sum()
+    df[f'{target_col}_freq_{window}s'] = freq
+    df[f'{target_col}_velocity_{window}s'] = velocity
+    return df
+
+def geo_risk_score(df, geo_col, fraud_col):
+    geo_fraud_rate = df.groupby(geo_col)[fraud_col].mean().to_dict()
+    df['geo_risk_score'] = df[geo_col].map(geo_fraud_rate)
+    return df
+
+def device_fingerprint_similarity(df, device_col):
+    # Cosine similarity to most common device per user
+    device_vectors = pd.get_dummies(df[device_col])
+    user_devices = device_vectors.groupby(df['user_id']).apply(lambda x: x.mean())
+    similarity = []
+    for idx, row in df.iterrows():
+        user_vec = user_devices.loc[row['user_id']].values
+        device_vec = device_vectors.loc[idx].values
+        sim = 1 - cosine(user_vec, device_vec)
+        similarity.append(sim)
+    df['device_similarity'] = similarity
+    return df
+
+# 2. Data Preparation (Example)
+def prepare_data(df):
+    df = sliding_window_features(df, 'timestamp', 'transaction_id')
+    df = geo_risk_score(df, 'geo_location', 'is_fraud')
+    df = device_fingerprint_similarity(df, 'device_fingerprint')
+    # Normalize features
+    feature_cols = ['amount', 'transaction_id_freq_3600s', 'transaction_id_velocity_3600s', 'geo_risk_score', 'device_similarity']
+    scaler = StandardScaler()
+    df[feature_cols] = scaler.fit_transform(df[feature_cols])
+    return df, feature_cols
+
+# 3. Model Training with SMOTE and Class Weights
+def train_lightgbm(X, y):
+    smote = SMOTE(sampling_strategy=0.1)
+    X_res, y_res = smote.fit_resample(X, y)
+
+    lgb_clf = lgb.LGBMClassifier(class_weight='balanced', n_jobs=-1)
+    param_dist = {
+        'num_leaves': [31, 63, 127],
+        'learning_rate': [0.01, 0.05, 0.1],
+        'n_estimators': [100, 200, 500],
+        'min_child_samples': [20, 50, 100]
+    }
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    auc_scorer = make_scorer(roc_auc_score, needs_proba=True)
+    search = RandomizedSearchCV(lgb_clf, param_dist, scoring=auc_scorer, n_iter=10, cv=skf, verbose=1, random_state=42)
+    search.fit(X_res, y_res)
+    return search.best_estimator_
+
+# 4. Precision-Recall Optimization
+def find_threshold(y_true, y_prob, target_recall=0.95):
+    precision, recall, thresholds = precision_recall_curve(y_true, y_prob)
+    idx = np.argmax(recall >= target_recall)
+    if idx >= len(thresholds): idx = len(thresholds) - 1
+    return thresholds[idx], precision[idx], recall[idx]
+
+# 5. Inference & Monitoring Framework
+class FraudInferenceMonitor:
+    def __init__(self, model, feature_cols, scaler):
+        self.model = model
+        self.feature_cols = feature_cols
+        self.scaler = scaler
+        self.threshold = None
+
+    def predict(self, X):
+        X_scaled = self.scaler.transform(X[self.feature_cols])
+        proba = self.model.predict_proba(X_scaled)[:, 1]
+        if self.threshold is None:
+            return proba
+        return (proba > self.threshold).astype(int)
+
+    def set_threshold(self, X_val, y_val, recall=0.95):
+        proba = self.model.predict_proba(X_val[self.feature_cols])[:, 1]
+        th, prec, rec = find_threshold(y_val, proba, recall)
+        self.threshold = th
+        return th, prec, rec
+
+    def psi(self, expected, actual, bins=10):
+        expected_perc, _ = np.histogram(expected, bins=bins, range=(0, 1), density=True)
+        actual_perc, _ = np.histogram(actual, bins=bins, range=(0, 1), density=True)
+        psi_val = np.sum((actual_perc - expected_perc) * np.log((actual_perc + 1e-5) / (expected_perc + 1e-5)))
+        return psi_val
+
+    def calibration(self, y_true, y_prob, bins=10):
+        bin_pred = pd.cut(y_prob, bins, labels=False)
+        cal = pd.DataFrame({'y_true': y_true, 'bin': bin_pred})
+        return cal.groupby('bin')['y_true'].mean()
+
+# 6. Example Pipeline Usage
+if __name__ == "__main__":
+    # Load your transaction data as df
+    df = pd.read_csv('transactions.csv')
+    df, feature_cols = prepare_data(df)
+    X = df[feature_cols]
+    y = df['is_fraud']
+
+    X_train, X_val, y_train, y_val = train_test_split(X, y, stratify=y, test_size=0.2, random_state=42)
+    model = train_lightgbm(X_train, y_train)
+
+    monitor = FraudInferenceMonitor(model, feature_cols, StandardScaler().fit(X_train))
+    th, prec, rec = monitor.set_threshold(X_val, y_val, recall=0.94)
+    print(f"Chosen threshold for recall=0.94: {th:.4f}, Precision: {prec:.3f}, Recall: {rec:.3f}")
+
+    # Monitoring example
+    y_val_proba = model.predict_proba(X_val)[:, 1]
+    psi_val = monitor.psi(X_train.mean(axis=1), X_val.mean(axis=1))
+    print(f"Population Stability Index (PSI): {psi_val:.3f}")
+
+    # Calibration
+    cal = monitor.calibration(y_val, y_val_proba)
+    print("Calibration by probability bin:", cal)
+
+    # Inference
+    # new_X = ... (new data in DataFrame)
+    # predictions = monitor.predict(new_X)
+
+    # Power BI: Export results for dashboard
+    df['predicted_proba'] = model.predict_proba(X)[:, 1]
+    df[['transaction_id', 'predicted_proba', 'is_fraud']].to_csv('fraud_predictions.csv', index=False)
